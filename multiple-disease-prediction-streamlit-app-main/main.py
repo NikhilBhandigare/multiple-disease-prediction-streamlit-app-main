@@ -1,215 +1,405 @@
 import os
 import sqlite3
+import hashlib
+import pickle
 import streamlit as st
-import subprocess
-import re
 import pandas as pd
 import plotly.express as px
+import google.generativeai as genai
+import re
+from fpdf import FPDF
+from io import BytesIO
+# ---------------------- CONFIG & SETUP ---------------------- #
+st.set_page_config("Health Assistant", layout="wide", page_icon="📈")
 
-# Function to create a database connection
+# Show logo or banner
+# Disease Prediction App Header
+st.markdown("<h1 style='text-align:center;'>🔬 Disease Prediction System</h1>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center;'>Predict Diabetes, Heart Disease, and Parkinson's using ML and recommended medicines,exercise, diet using ai</p>", unsafe_allow_html=True)
+
+
+# ---------------------- GEMINI SETUP ---------------------- #
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY") or "AIzaSyAMbLh4EqrMAR6Yo6i-wnNVdVh3cJjEYqM")
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+
+# ---------------------- DATABASE SETUP ---------------------- #
 def create_connection(db_file):
-    conn = None
     try:
-        conn = sqlite3.connect(db_file)
-        return conn
+        return sqlite3.connect(db_file, check_same_thread=False)
     except sqlite3.Error as e:
-        st.error(f"Error: {e}")
-    return conn
+        st.error(f"Database error: {e}")
+        return None
 
-# Function to create patient table
 def create_patient_table(conn):
-    try:
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS patients (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                email TEXT,
-                phone TEXT,
-                address TEXT,
-                disease TEXT
-            )
-        ''')
-        conn.commit()
-    except sqlite3.Error as e:
-        st.error(f"Error: {e}")
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS patients (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT UNIQUE,
+        gender TEXT,
+        phone TEXT,
+        password TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS predictions (
+        id INTEGER PRIMARY KEY,
+        email TEXT,
+        disease TEXT,
+        result TEXT)''')
+    conn.commit()
 
-# Function to add a new patient
-def add_patient(conn, name, email, phone, address, disease):
-    if not any(char.isalpha() for char in name):
-        st.error("Please enter a name with at least one alphabet character.")
-        return False
-    # Check if any of the input fields are empty
-    if not name or not email or not phone or not address or not disease:
-        st.error("All fields are required. Please fill in all the information.")
-        return False
-    
+# ---------------------- UTILS ---------------------- #
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def is_valid_email(email):
+    pattern = r"^[\w\.-]+@[\w\.-]+\.\w+$"
+    return re.match(pattern, email)
+
+def add_patient(conn, name, email, gender, phone, password):
     try:
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO patients (name, email, phone, address, disease) VALUES (?, ?, ?, ?, ?)
-        ''', (name, email, phone, address, disease))
+        conn.cursor().execute("INSERT INTO patients (name, email, gender, phone, password) VALUES (?, ?, ?, ?, ?)",
+            (name, email, gender, phone, hash_password(password)))
         conn.commit()
-        st.success("Patient added successfully.")
-        
-        # Redirect to another page after successful addition
+        st.success("✅ Patient added successfully.")
+
         return True
-    except sqlite3.Error as e:
-        st.error(f"Error: {e}")
+    except sqlite3.IntegrityError:
+        st.error("❌ Email already exists.")
         return False
 
+def get_all_patients(conn):
+    return pd.read_sql("SELECT id, name, email, gender, phone FROM patients", conn)
 
-# Function to retrieve all patients
-def get_patients(conn):
-    try:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT * FROM patients
-        ''')
-        rows = cursor.fetchall()
-        return rows
-    except sqlite3.Error as e:
-        st.error(f"Error: {e}")
-        return []
+def get_disease_distribution(conn):
+    return pd.read_sql("SELECT disease, COUNT(*) as count FROM predictions GROUP BY disease", conn)
 
-# Function to clear all data in the database
-def clear_database(conn):
-    try:
-        cursor = conn.cursor()
-        cursor.execute('''
-            DELETE FROM patients
-        ''')
+def verify_user(conn, email, password):
+    if email == "admin@gmail.com" and password == "admin":
+        return "admin"
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM patients WHERE email=? AND password=?",
+        (email, hash_password(password)))
+    return "user" if cursor.fetchone() else None
+
+def save_prediction(conn, email, disease, result):
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO predictions (email, disease, result) VALUES (?, ?, ?)",
+                   (email, disease, result))
+    conn.commit()
+
+def delete_patient(conn, patient_id):
+    cursor = conn.cursor()
+    cursor.execute("SELECT email FROM patients WHERE id=?", (patient_id,))
+    row = cursor.fetchone()
+    if row:
+        email = row[0]
+        cursor.execute("DELETE FROM predictions WHERE email=?", (email,))
+        cursor.execute("DELETE FROM patients WHERE id=?", (patient_id,))
         conn.commit()
-        st.session_state.is_database_cleared = True  # Set the flag
-        st.success("Database cleared successfully.")
-    except sqlite3.Error as e:
-        st.error(f"Error: {e}")
 
-# Function to display the Admin Page with clear database option and disease-wise patient pie chart
-def admin_page(conn):
-    st.title("Admin Page")
+def update_patient(conn, patient_id, name, email, gender, phone):
+    cursor = conn.cursor()
+    cursor.execute("UPDATE patients SET name=?, email=?, gender=?, phone=? WHERE id=?",
+                   (name, email, gender, phone, patient_id))
+    conn.commit()
 
-    # Clear Database option
-    if st.button("Clear Database"):
-        clear_database(conn)
+def clear_all_data(conn):
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM predictions")
+    cursor.execute("DELETE FROM patients")
+    conn.commit()
 
-    # Display disease-wise patient pie chart
-    st.subheader("Disease-wise Patient Distribution")
-    patients = get_patients(conn)
-    df = pd.DataFrame(patients, columns=['ID', 'Name', 'Email', 'Phone', 'Address', 'Disease'])
-    if not df.empty:
-        disease_counts = df['Disease'].value_counts()
-        fig = px.pie(names=disease_counts.index, values=disease_counts.values, title="Disease-wise Patient Distribution")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No patient data available to display.")
+# ---------------------- LOAD MODELS ---------------------- #
+working_dir = os.path.dirname(os.path.abspath(__file__))
+diabetes_model = pickle.load(open(f"{working_dir}/saved_models/diabetes_model.sav", 'rb'))
+heart_model = pickle.load(open(f"{working_dir}/saved_models/heart_disease_model.sav", 'rb'))
+parkinsons_model = pickle.load(open(f"{working_dir}/saved_models/parkinsons_model.sav", 'rb'))
 
-# Function to display the View patients Page with search functionality
-def view_patients(conn):
-    st.title("View patients")
+# ---------------------- GEMINI FUNCTION ---------------------- #
+def ai_recommendation(email, disease, result, inputs):
+    prompt = f"""
+Patient Email: {email}
+Disease: {disease}
+Prediction Result: {result}
+Parameters: {inputs}
 
-    # Check if the database is cleared
-    if st.session_state.is_database_cleared:
-        st.info("Database is cleared. No patients to display.")
+Give short, real, and actionable recommendations with no disclaimers:
+1. List 2-3 example generic medicines often prescribed for {disease}
+2. Give a short, 2-line exercise suggestion tailored for this condition
+3. Give a short Indian diet tip specific to {disease}
+"""
+    try:
+        response = gemini_model.generate_content(prompt)
+        return f"""
+**🎒 Recommended Medicines:**
+{response.text.split('2.')[0].strip().replace('1.', '').strip()}
+
+**🏋️ Exercise Suggestion:**
+{response.text.split('2.')[1].split('3.')[0].strip()}
+
+**🍜 Indian Diet Tip:**
+{response.text.split('3.')[1].strip()}
+"""
+    except Exception as e:
+        return f"Gemini Error: {e}"
+
+def remove_emojis(text):
+    emoji_pattern = re.compile("["
+        u"\U0001F600-\U0001F64F"  # emoticons
+        u"\U0001F300-\U0001F5FF"  # symbols & pictographs
+        u"\U0001F680-\U0001F6FF"  # transport & map symbols
+        u"\U0001F1E0-\U0001F1FF"  # flags
+        u"\U00002500-\U00002BEF"  # Chinese characters
+        u"\U00002702-\U000027B0"
+        u"\U000024C2-\U0001F251"
+        "]+", flags=re.UNICODE)
+    return emoji_pattern.sub('', text)
+
+def generate_pdf(email, disease, inputs, result, recommendations):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+
+    pdf.set_title("Disease Prediction Report")
+    pdf.cell(200, 10, txt="Disease Prediction Report", ln=True, align='C')
+    pdf.cell(200, 10, txt=f"Patient Email: {email}", ln=True)
+
+    pdf.ln(5)
+    pdf.set_font("Arial", 'B', size=12)
+    pdf.cell(200, 10, txt="Entered Parameters:", ln=True)
+    pdf.set_font("Arial", size=12)
+    for key, val in inputs.items():
+        pdf.cell(200, 8, txt=f"{key}: {val}", ln=True)
+
+    pdf.ln(5)
+    pdf.set_font("Arial", 'B', size=12)
+    pdf.cell(200, 10, txt=f"Prediction Result: {result}", ln=True)
+
+    pdf.ln(5)
+    pdf.set_font("Arial", 'B', size=12)
+    pdf.cell(200, 10, txt="Recommendations:", ln=True)
+    pdf.set_font("Arial", size=12)
+
+    clean_text = remove_emojis(recommendations)
+    for line in clean_text.split('\n'):
+        pdf.multi_cell(0, 8, txt=line)
+
+    pdf_output = pdf.output(dest='S').encode('latin1')
+    return BytesIO(pdf_output)
+# ---------------------- UI FUNCTIONS ---------------------- #
+def add_patient_ui(conn):
+    st.header("➕ Add New Patient")
+    name = st.text_input("Name")
+    email = st.text_input("Email")
+    gender = st.selectbox("Gender", ["Select", "Male", "Female", "Other"])
+    phone = st.text_input("Mobile")
+    password = st.text_input("Password", type="password")
+
+    if st.button("➕ Add Patient"):
+        if not name.strip():
+            st.error("Name is required.")
+        elif not email.strip():
+            st.error("Email is required.")
+        elif not is_valid_email(email):
+            st.error("Invalid email format.")
+        elif gender == "Select":
+            st.error("Please select a valid gender.")
+        elif not phone.strip():
+            st.error("Mobile number is required.")
+        elif not password:
+            st.error("Password is required.")
+        else:
+            add_patient(conn, name, email, gender, phone, password)
+
+def view_patients_ui(conn):
+    st.header("👥 All Patients")
+    df = get_all_patients(conn)
+    if df.empty:
+        st.info("No patients found.")
         return
+    for idx, row in df.iterrows():
+        with st.expander(f"{row['name']} ({row['email']})"):
+            new_name = st.text_input("Name", value=row["name"], key=f"name_{row['id']}_{idx}")
+            new_email = st.text_input("Email", value=row["email"], key=f"email_{row['id']}_{idx}")
+            new_gender = st.selectbox("Gender", ["Male", "Female", "Other"],
+                                      index=["Male", "Female", "Other"].index(row["gender"]),
+                                      key=f"gender_{row['id']}_{idx}")
+            new_phone = st.text_input("Phone", value=row["phone"], key=f"phone_{row['id']}_{idx}")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Update", key=f"update_{row['id']}_{idx}"):
+                    update_patient(conn, row["id"], new_name, new_email, new_gender, new_phone)
+                    st.success("Updated successfully.")
+                    st.rerun()
+            with col2:
+                if st.button("🗑️ Delete", key=f"delete_{row['id']}_{idx}"):
+                    delete_patient(conn, row["id"])
+                    st.warning("Deleted successfully.")
+                    st.rerun()
 
-    # Search bar for filtering patients by name
-    search_query = st.text_input("Search by name:", "").strip().lower()
+def predict_disease(conn):
+    st.header("🔬 Disease Prediction")
+    st.image("prediction_banner.png", use_column_width=True)
+    email = st.session_state.get("user_email", "admin@gmail.com")
+    disease = st.selectbox("Select Disease", ["Diabetes", "Heart Disease", "Parkinson's"])
+    result = None
+    inputs = {}
 
-    # Retrieve all patients from the database
-    patients = get_patients(conn)
+def predict_disease(conn):
+    st.header("Disease Prediction")
+    email = st.session_state.get("user_email", "admin@gmail.com")
+    disease = st.selectbox("Select Disease", ["Diabetes", "Heart Disease", "Parkinson's"])
+    result = None
+    inputs = {}
 
-    # Filter patients based on the search query
-    filtered_patients = [patient for patient in patients if search_query.lower() in patient[1].lower()]
+    if disease == "Diabetes":
+        st.subheader("Enter Diabetes Parameters")
+        cols = st.columns(3)
+        inputs = {
+            'Pregnancies': cols[0].number_input('Pregnancies', min_value=0),
+            'Glucose': cols[1].number_input('Glucose', min_value=0),
+            'BloodPressure': cols[2].number_input('Blood Pressure', min_value=0),
+            'SkinThickness': cols[0].number_input('Skin Thickness', min_value=0),
+            'Insulin': cols[1].number_input('Insulin', min_value=0),
+            'BMI': cols[2].number_input('BMI', min_value=0.0)
+        }
+        if st.button("Predict"):
+            val = list(inputs.values())
+            pred = diabetes_model.predict([val])[0]
+            result = "Diabetic" if pred == 1 else "Non-Diabetic"
+            st.success(f"Prediction: {result}")
 
-    # Display filtered patients in a table
-    if filtered_patients:
-        st.write("Patients Information:")
-        # Create a DataFrame from the filtered patients
-        df = pd.DataFrame(filtered_patients, columns=['ID', 'Name', 'Email', 'Phone', 'Address', 'Disease'])
-        # Display the DataFrame as a table
-        st.table(df)
+            
+    elif disease == "Heart Disease":
+        st.subheader("Enter Heart Parameters")
+        cols = st.columns(3)
+        inputs = {
+            'Sex': cols[0].selectbox("Sex", [0, 1]),
+            'Chest Pain': cols[1].selectbox("Chest Pain Type", [0, 1, 2, 3]),
+            'RestBP': cols[2].number_input("Resting BP"),
+            'Chol': cols[0].number_input("Cholesterol"),
+            'FBS': cols[1].selectbox("Fasting Sugar > 120?", [0, 1]),
+            'ECG': cols[2].selectbox("ECG", [0, 1, 2]),
+            'MaxHR': cols[0].number_input("Max Heart Rate"),
+            'Angina': cols[1].selectbox("Exercise Angina", [0, 1]),
+            'Oldpeak': cols[2].number_input("Oldpeak"),
+            'Slope': cols[0].selectbox("Slope", [0, 1, 2]),
+            'CA': cols[1].selectbox("CA", [0, 1, 2, 3, 4]),
+            'Thal': cols[2].selectbox("Thal", [0, 1, 2, 3])
+        }
+        if st.button("Predict"):
+            val = list(inputs.values())
+            pred = heart_model.predict([val])[0]
+            result = "Heart Disease" if pred == 1 else "No Heart Disease"
+            st.success(f"Prediction: {result}")
+
+    elif disease == "Parkinson's":
+        st.subheader("Enter Parkinson's Parameters")
+        labels = ["Fo", "Fhi", "Flo", "Jitter %", "Jitter Abs", "RAP", "PPQ", "DDP",
+                  "Shimmer", "Shimmer dB", "APQ3", "APQ5", "APQ", "DDA", "NHR", "HNR",
+                  "RPDE", "DFA", "Spread1", "Spread2", "D2", "PPE"]
+        cols = st.columns(3)
+        for i, label in enumerate(labels):
+            inputs[label] = cols[i % 3].number_input(label)
+        if st.button("Predict"):
+            val = list(inputs.values())
+            pred = parkinsons_model.predict([val])[0]
+            result = "Parkinson's" if pred == 1 else "No Parkinson's"
+            st.success(f"Prediction: {result}")
+
+    if result and "No" not in result:
+        save_prediction(conn, email, disease, result)
+        st.subheader("AI-Powered Recommendations")
+    
+        with st.spinner("Generating personalized recommendations..."):
+            recommendations = ai_recommendation(email, disease, result, inputs)
+
+        st.markdown(recommendations)
+
+        pdf_buffer = generate_pdf(email, disease, inputs, result, recommendations)
+        st.download_button("📄 Download Report", data=pdf_buffer, file_name="prediction_report.pdf", mime="application/pdf")
+
+def show_disease_distribution(conn):
+    st.header("Disease Distribution")
+    df = get_disease_distribution(conn)
+    if not df.empty:
+        fig = px.pie(df, names='disease', values='count', title='Prediction Count by Disease')
+        st.plotly_chart(fig)
     else:
-        st.warning("No patients found matching the search criteria.")
+        st.info("No prediction data available.")
 
-# Admin login function
-def admin_login():
-    st.title("Admin Login")
-    if not st.session_state.is_admin_logged_in:
-        email_placeholder = st.empty()
-        password_placeholder = st.empty()
-        email = email_placeholder.text_input("Email", key="admin_email")
-        password = password_placeholder.text_input("Password", type="password", key="admin_password")
-        login_button = st.button("Login")
-        if login_button:
-            if email == "admin@gmail.com" and password == "admin":
-                st.session_state.is_admin_logged_in = True
-                st.success("Login successful.")
-                email_placeholder.empty()
-                password_placeholder.empty()
-                st.session_state.show_login_button = False  # Hide the login button
-                st.session_state.show_login_message = False  # Hide the login successful message
+# ---------------------- MAIN FLOW ---------------------- #
+conn = create_connection("patients.db")
+create_patient_table(conn)
+
+if 'user_role' not in st.session_state:
+    st.session_state.user_role = None
+
+if st.session_state.user_role is None:
+    st.subheader("🔐 Login")
+    email = st.text_input("Email")
+    password = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if not email.strip():
+            st.error("Email is required.")
+        elif not is_valid_email(email):
+            st.error("Please enter a valid email address.")
+        elif not password:
+            st.error("Password is required.")
+        else:
+            role = verify_user(conn, email, password)
+            if role == "admin":
+                st.session_state.user_role = "admin"
+                st.toast("Admin logged in successfully!", icon="✅")
+                st.rerun()
+            elif role == "user":
+                st.session_state.user_role = "user"
+                st.session_state.user_email = email
+                st.toast("User logged in successfully!", icon="✅")
+                st.rerun()
             else:
-                st.error("Invalid email or password. Please try again.")
-    else:
-        st.success("Logged in as admin.")
-    
-    # Place the logout button at the top right corner
-    logout_placeholder = st.empty()
-    logout_placeholder.write("")  # Create space for the button
-    if st.session_state.is_admin_logged_in:
-        logout_button = logout_placeholder.button("Logout", key="logout_button_admin_login")
-        if logout_button:
-            st.session_state.is_admin_logged_in = False
-            st.success("Logged out successfully.")
+                st.error("Invalid email or password.")
 
-# Function to display the "Add patient" page for both admin and user
-def add_patient_page(conn):
-    st.title("Add patient")
-    name = st.text_input("Name", key="add_name")
-    email = st.text_input("Email", key="add_email")
-    phone = st.text_input("Phone", key="add_phone")
-    address = st.text_input("Address", key="add_address")
-    disease = st.text_input("Disease", key="add_disease")
-    if st.button("Add patient"):
-        if add_patient(conn, name, email, phone, address, disease):
-            st.markdown("[Next Page](http://localhost:8501)")
+elif st.session_state.user_role == "admin":
+    option = st.sidebar.selectbox("🛠️ Admin Options", [
+        "➕ Add Patient", "👥 View Patients", "🔬 Predict Disease", "📊 Visualize Data", "🗑️ Clear All Data"])
+    with st.sidebar.expander("🚪 Logout", expanded=False):
+        if st.checkbox("Are you sure you want to logout?"):
+            if st.button("✅ Confirm Logout"):
+                st.session_state.user_role = None
+                st.session_state.user_email = None
+                st.toast("Logged out successfully.", icon="👋")
+                st.rerun()
 
-# Main function
-def main():
-    # Initialize session state
-    if 'is_database_cleared' not in st.session_state:
-        st.session_state.is_database_cleared = False
-    if 'is_admin_logged_in' not in st.session_state:
-        st.session_state.is_admin_logged_in = False
-    if 'chart_update_trigger' not in st.session_state:
-        st.session_state.chart_update_trigger = 0
+    if option == "➕ Add Patient":
+        add_patient_ui(conn)
+    elif option == "👥 View Patients":
+        view_patients_ui(conn)
+    elif option == "🔬 Predict Disease":
+        predict_disease(conn)
+    elif option == "📊 Visualize Data":
+        show_disease_distribution(conn)
+    elif option == "🗑️ Clear All Data":
+        with st.expander("⚠️ Confirm Clear All Data", expanded=False):
+            confirm_clear = st.checkbox("Yes, I want to clear all patient and prediction data.")
+            if confirm_clear and st.button("🧹 Clear Now"):
+                clear_all_data(conn)
+                st.success("All data cleared.")
+                st.rerun()
 
-    # Set page configuration
-    st.set_page_config(page_title="Health Assistant", layout="wide", page_icon="🧑‍⚕️")
-    
-    # Sidebar for navigation
-    with st.sidebar:
-        st.title("Navigation")
-        selected = st.radio("Go to:", ["Admin"])
 
-    # Database setup
-    database = "patient_history.db"
-    conn = create_connection(database)
-    if conn is not None:
-        create_patient_table(conn)
-        
-        # Admin page
-        if selected == "Admin":
-            admin_login()
-            if st.session_state.is_admin_logged_in:
-                admin_page(conn)
-                st.title("Navigation")
-                selected_page = st.radio("Go to:", ["Add patient", "View patients"])
-                if selected_page == "Add patient":
-                    add_patient_page(conn)
-                elif selected_page == "View patients":
-                    view_patients(conn)
+elif st.session_state.user_role == "user":
+    with st.sidebar.expander("🚪 Logout", expanded=False):
+        if st.checkbox("Are you sure you want to logout?"):
+            if st.button("✅ Confirm Logout"):
+                st.session_state.user_role = None
+                st.session_state.user_email = None
+                st.toast("Logged out successfully.", icon="👋")
+                st.rerun()
 
-if __name__ == "__main__":
-    main()
+    predict_disease(conn)
+
+# if st.sidebar.button("🚪 Logout"):
+#     st.session_state.user_role = None
+#     st.session_state.user_email = None
+#     st.toast("Logged out successfully.", icon="👋")
+#     st.rerun()
